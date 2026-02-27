@@ -1,0 +1,7 @@
+__pycache__/
+*.db
+*.pkl
+*.sqbpro
+.env
+*.pyc
+.DS_Store
