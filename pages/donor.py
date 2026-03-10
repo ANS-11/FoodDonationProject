@@ -1,7 +1,7 @@
 import streamlit as st
 from auth_db import connect_db
 from email_utils import send_email
-from datetime import datetime
+from datetime import datetime, time
 from recommend_food import load_model
 
 
@@ -47,7 +47,6 @@ st.divider()
 # =========================================================
 # LOAD REQUESTS
 # =========================================================
-@st.cache_data(ttl=10)
 def load_requests(donor_id):
 
     conn = connect_db()
@@ -66,12 +65,11 @@ def load_requests(donor_id):
         FROM requests r
         JOIN users u ON r.recipient_id = u.id
         JOIN food_listings f ON r.food_id = f.Food_ID
-        WHERE r.donor_id=?
-        AND r.status='PENDING'
+        WHERE r.donor_id=? AND r.status='PENDING'
     """, (donor_id,)).fetchall()
 
     conn.close()
-    return [tuple(row) for row in rows]
+    return rows
 
 
 # =========================================================
@@ -107,7 +105,7 @@ else:
 
         col1, col2 = st.columns(2)
 
-        # ---------------- APPROVE ----------------
+        # ===================== APPROVE =====================
         if col1.button("Approve", key=f"a_{req_id}"):
 
             conn = connect_db()
@@ -115,7 +113,7 @@ else:
 
             if available_qty < requested_qty:
                 st.error("Not enough quantity available!")
-
+                conn.close()
             else:
                 cursor.execute("""
                     UPDATE food_listings
@@ -129,16 +127,10 @@ else:
                     WHERE request_id=?
                 """, (req_id,))
 
-                cursor.execute("""
-                    UPDATE food_listings
-                    SET Safety_Status='UNSAFE'
-                    WHERE Food_ID=? AND Quantity <= 0
-                """, (food_id,))
-
                 conn.commit()
                 conn.close()
 
-                # ✅ EMAIL TO RECIPIENT
+                # ✅ SEND APPROVAL EMAIL
                 send_email(
                     recipient_email,
                     "✅ Food Request Approved",
@@ -150,18 +142,16 @@ Hello {recipient_name},
 Food Item: {food}
 Approved Quantity: {requested_qty}
 
-👉 Please login to the Food Donation Portal
-to view collection details.
+Please login to the Food Donation Portal to view pickup details.
 
 Thank you for reducing food waste 💚
 """
                 )
 
-                load_requests.clear()
                 st.success("Request Approved!")
                 st.rerun()
 
-        # ---------------- REJECT ----------------
+        # ===================== REJECT =====================
         if col2.button("Reject", key=f"r_{req_id}"):
 
             conn = connect_db()
@@ -176,7 +166,7 @@ Thank you for reducing food waste 💚
             conn.commit()
             conn.close()
 
-            # ✅ EMAIL TO RECIPIENT
+            # ❌ SEND REJECTION EMAIL
             send_email(
                 recipient_email,
                 "❌ Food Request Rejected",
@@ -187,14 +177,12 @@ We are sorry 😔.
 
 Your request for "{food}" was rejected by the donor.
 
-👉 Please login to the Food Donation Portal
-and request food from another nearby donor.
+Please login and request from another nearby donor.
 
 Thank you for understanding.
 """
             )
 
-            load_requests.clear()
             st.warning("Request Rejected.")
             st.rerun()
 
@@ -215,7 +203,18 @@ with st.form("donation_form"):
         step=1
     )
 
+    food_type = st.selectbox(
+        "Food Type",
+        ["Freshly Cooked", "Packaged", "Bakery", "Fruits/Vegetables"]
+    )
+
     expiry_date = st.date_input("Expiry Date")
+
+    if food_type == "Freshly Cooked":
+        expiry_time = st.time_input("Expiry Time")
+        expiry_datetime = datetime.combine(expiry_date, expiry_time)
+    else:
+        expiry_datetime = datetime.combine(expiry_date, time(23, 59))
 
     provider_type = st.selectbox(
         "Provider Type",
@@ -234,19 +233,18 @@ if submitted:
         st.warning("Please enter food name.")
         st.stop()
 
-    today = datetime.today().date()
-    days_to_expiry = (expiry_date - today).days
+    current_time = datetime.now()
 
-    if days_to_expiry < 0:
+    if expiry_datetime < current_time:
         st.error("Food already expired.")
         st.stop()
 
+    time_difference = expiry_datetime - current_time
+    days_to_expiry = time_difference.total_seconds() / (60 * 60 * 24)
+
     prediction = model.predict([[quantity, days_to_expiry]])
 
-    if days_to_expiry <= 0:
-        safety_status = "UNSAFE"
-    else:
-        safety_status = "SAFE" if prediction[0] == 1 else "UNSAFE"
+    safety_status = "SAFE" if prediction[0] == 1 else "UNSAFE"
 
     conn = connect_db()
     cursor = conn.cursor()
@@ -270,15 +268,13 @@ if submitted:
         st.session_state.user_id,
         user_data["lat"],
         user_data["lon"],
-        str(expiry_date),
+        expiry_datetime.strftime("%Y-%m-%d %H:%M:%S"),
         days_to_expiry,
         safety_status
     ))
 
     conn.commit()
     conn.close()
-
-    load_requests.clear()
 
     if safety_status == "SAFE":
         st.success("Donation submitted successfully!")

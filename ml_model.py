@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import StandardScaler
 import joblib
 
 print("Loading dataset...")
@@ -12,75 +13,97 @@ print("Loading dataset...")
 # ------------------------------------------------
 df = pd.read_csv("Data/food_listings_data.csv")
 
-# ------------------------------------------------
-# STEP 1 — Convert Expiry Date
-# ------------------------------------------------
 df['Expiry_Date'] = pd.to_datetime(df['Expiry_Date'], errors='coerce')
 df = df.dropna(subset=['Expiry_Date'])
 
-# Use fixed reference date
-today = pd.Timestamp("2025-03-20")
+reference_date = pd.Timestamp("2025-03-01")
 
-df['days_to_expiry'] = (df['Expiry_Date'] - today).dt.days
+df['days_to_expiry'] = (
+    df['Expiry_Date'] - reference_date
+).dt.total_seconds() / (60 * 60 * 24)
+
+df = df.dropna(subset=['days_to_expiry'])
 
 # ------------------------------------------------
-# STEP 2 — CREATE REALISTIC SAFETY LABEL
+# CREATE SAFETY LABEL
 # ------------------------------------------------
-# Instead of deterministic rule, use probability
+# Food is safe if expiry > 2 days and quantity > 5
+df['safe'] = np.where(
+    (df['days_to_expiry'] > 2) & (df['Quantity'] > 5),
+    1,
+    0
+)
 
-np.random.seed(42)
-
-# Sigmoid function to convert days_to_expiry into probability
-probability_safe = 1 / (1 + np.exp(-0.8 * df['days_to_expiry']))
-
-random_values = np.random.rand(len(df))
-
-df['safe'] = np.where(random_values < probability_safe, 1, 0)
-
-print("\nClass Distribution:")
+print("\nInitial Class Distribution:")
 print(df['safe'].value_counts())
 
-# Ensure at least 2 classes
-if df['safe'].nunique() < 2:
-    raise ValueError("Dataset has only ONE class after labeling.")
+# ------------------------------------------------
+# BALANCE DATASET
+# ------------------------------------------------
+safe_df = df[df['safe'] == 1]
+unsafe_df = df[df['safe'] == 0]
+
+# Balance classes
+min_size = min(len(safe_df), len(unsafe_df))
+
+safe_df = safe_df.sample(min_size, random_state=42)
+unsafe_df = unsafe_df.sample(min_size, random_state=42)
+
+df = pd.concat([safe_df, unsafe_df])
+
+print("\nBalanced Class Distribution:")
+print(df['safe'].value_counts())
 
 # ------------------------------------------------
-# STEP 3 — Feature Selection
+# FEATURES
 # ------------------------------------------------
-features = ['Quantity', 'days_to_expiry']
-
-X = df[features]
+X = df[['Quantity', 'days_to_expiry']]
 y = df['safe']
 
 # ------------------------------------------------
-# STEP 4 — Train/Test Split
+# SCALE FEATURES
+# ------------------------------------------------
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# ------------------------------------------------
+# TRAIN TEST SPLIT
 # ------------------------------------------------
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y
 )
 
-# ------------------------------------------------
-# STEP 5 — Train Model
-# ------------------------------------------------
 print("\nTraining Logistic Regression model...")
 
-model = LogisticRegression(max_iter=1000)
+# ------------------------------------------------
+# TRAIN MODEL
+# ------------------------------------------------
+model = LogisticRegression(
+    max_iter=1000,
+    class_weight='balanced'
+)
+
 model.fit(X_train, y_train)
 
 # ------------------------------------------------
-# STEP 6 — Evaluate
+# MODEL EVALUATION
 # ------------------------------------------------
-predictions = model.predict(X_test)
+pred = model.predict(X_test)
 
-accuracy = accuracy_score(y_test, predictions)
+accuracy = accuracy_score(y_test, pred) * 100
 
-print(f"\nModel Accuracy: {accuracy*100:.2f}%")
-print("\nClassification Report:\n", classification_report(y_test, predictions))
+print(f"\nModel Accuracy: {accuracy:.2f}%")
+
+print("\nClassification Report:")
+print(classification_report(y_test, pred, zero_division=0))
 
 # ------------------------------------------------
-# STEP 7 — Save Model
+# SAVE MODEL
 # ------------------------------------------------
 joblib.dump(model, "food_safety_model.pkl")
 
-print("\n✅ Model saved as food_safety_model.pkl")
-print("READY to plug into your food donation app 🚀")
+print("\nModel saved successfully as food_safety_model.pkl")

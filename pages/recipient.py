@@ -90,7 +90,7 @@ if st.button("Find Nearest Safe Donor"):
         receiver, results = recommend_food(
             receiver_id,
             food_type,
-            15
+            1
         )
 
     st.session_state.search_results = (receiver, results)

@@ -3,26 +3,18 @@ from geopy.distance import geodesic
 import streamlit as st
 from auth_db import connect_db
 import joblib
+import time
 
-
-# =====================================================
-# LOAD ML MODEL ONLY ONCE
-# =====================================================
 @st.cache_resource
 def load_model():
     return joblib.load("food_safety_model.pkl")
-
 
 model = load_model()
 
 MAX_DISTANCE_KM = 200
 
 
-# =====================================================
-# GET RECEIVER INFO
-# =====================================================
 def get_receiver(user_id):
-
     conn = connect_db()
     cursor = conn.cursor()
 
@@ -33,14 +25,13 @@ def get_receiver(user_id):
     """, (user_id,))
 
     receiver = cursor.fetchone()
-
+    conn.close()
     return receiver
 
 
-# =====================================================
-# MAIN RECOMMENDER
-# =====================================================
 def recommend_food(user_id, food_requested, quantity_needed):
+
+    start_time = time.time()   # START TIMER
 
     receiver = get_receiver(user_id)
 
@@ -54,9 +45,6 @@ def recommend_food(user_id, food_requested, quantity_needed):
 
     receiver_coords = (r_lat, r_lon)
 
-    # ------------------------------------------------
-    # LOAD FOOD LISTINGS
-    # ------------------------------------------------
     conn = connect_db()
 
     df = pd.read_sql("""
@@ -65,40 +53,41 @@ def recommend_food(user_id, food_requested, quantity_needed):
         WHERE Quantity > 0
     """, conn)
 
+    conn.close()
+
     if df.empty:
         return receiver, pd.DataFrame()
 
-    # ------------------------------------------------
-    # EXPIRY FILTER
-    # ------------------------------------------------
-    df['Expiry_Date'] = pd.to_datetime(df['Expiry_Date'])
+    df['Expiry_Date'] = pd.to_datetime(
+        df['Expiry_Date'],
+        format='mixed',
+        errors='coerce'
+    )
 
-    today = pd.Timestamp.now()
+    df = df.dropna(subset=['Expiry_Date'])
+
+    current_time = pd.Timestamp.now()
+
+    df = df[df['Expiry_Date'] > current_time]
+
+    if df.empty:
+        return receiver, pd.DataFrame()
 
     df['days_to_expiry'] = (
-        df['Expiry_Date'] - today
-    ).dt.days
+        (df['Expiry_Date'] - current_time)
+        .dt.total_seconds() / (60 * 60 * 24)
+    )
 
-    df = df[df['days_to_expiry'] > 0]
-
-    if df.empty:
-        return receiver, pd.DataFrame()
-
-    # ------------------------------------------------
-    # ML SAFETY PREDICTION
-    # ------------------------------------------------
+    # ML Prediction
     features = df[['Quantity', 'days_to_expiry']]
+    probabilities = model.predict_proba(features)[:, 1]
 
-    df['safe'] = model.predict(features)
-
-    df = df[df['safe'] == 1]
+    df['safe_probability'] = probabilities
+    df = df[df['safe_probability'] > 0.5]
 
     if df.empty:
         return receiver, pd.DataFrame()
 
-    # ------------------------------------------------
-    # FOOD MATCH
-    # ------------------------------------------------
     food_requested = food_requested.lower().strip()
 
     df = df[
@@ -109,44 +98,32 @@ def recommend_food(user_id, food_requested, quantity_needed):
     if df.empty:
         return receiver, pd.DataFrame()
 
-    # ------------------------------------------------
-    # QUANTITY FILTER
-    # ------------------------------------------------
     df = df[df['Quantity'] >= quantity_needed]
 
     if df.empty:
         return receiver, pd.DataFrame()
 
-    # ------------------------------------------------
-    # DISTANCE CALCULATION
-    # ------------------------------------------------
     df = df.dropna(subset=['lat', 'lon'])
 
-    distances = []
-
-    for _, row in df.iterrows():
-        distance = geodesic(
+    df['distance_km'] = df.apply(
+        lambda row: geodesic(
             receiver_coords,
             (row['lat'], row['lon'])
-        ).km
-
-        distances.append(distance)
-
-    df['distance_km'] = distances
+        ).km,
+        axis=1
+    )
 
     df = df[df['distance_km'] <= MAX_DISTANCE_KM]
 
     if df.empty:
         return receiver, pd.DataFrame()
 
-    # ------------------------------------------------
-    # SMART RANKING
-    # ------------------------------------------------
-    df['score'] = (
-        (0.7 * df['distance_km'])
-        - (0.3 * df['Quantity'])
-    )
+    # Ranking
+    df['score'] = (0.7 * df['distance_km']) - (0.3 * df['Quantity'])
 
     nearest = df.sort_values('score').head(5)
+
+    end_time = time.time()   # END TIMER
+    print("Recommendation Response Time:", round(end_time - start_time, 3), "seconds")
 
     return receiver, nearest
