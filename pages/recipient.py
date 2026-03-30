@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 # ------------------------------------------------
 st.session_state.setdefault("search_results", None)
 st.session_state.setdefault("success_msg", None)
-st.session_state.setdefault("excluded_donors", set())
 
 # ------------------------------------------------
 # PAGE SECURITY
@@ -47,35 +46,39 @@ if st.session_state.success_msg:
     st.session_state.success_msg = None
 
 # ------------------------------------------------
-# GET EXCLUDED DONORS FROM DB ✅ NEW
+# BLOCKED DONORS (FOOD SPECIFIC)
 # ------------------------------------------------
-def get_excluded_donors(receiver_id):
+def get_blocked_donors(receiver_id, food_id):
     conn = connect_db()
     cursor = conn.cursor()
 
     rows = cursor.execute("""
         SELECT donor_id FROM requests
         WHERE recipient_id = ?
+        AND food_id = ?
         AND status IN ('REJECTED','EXPIRED')
-    """, (receiver_id,)).fetchall()
+    """, (receiver_id, food_id)).fetchall()
 
     conn.close()
     return {r[0] for r in rows}
 
 # ------------------------------------------------
-# SAFE FOOD LIST
+# SAFE FOOD LIST (FIXED ✅)
 # ------------------------------------------------
 @st.cache_data(ttl=20)
 def get_safe_foods():
     conn = connect_db()
     cursor = conn.cursor()
 
+    current_date = datetime.now().strftime("%Y-%m-%d")
+
     foods = cursor.execute("""
         SELECT DISTINCT Food_Name
         FROM food_listings
         WHERE Safety_Status='SAFE'
         AND Quantity > 0
-    """).fetchall()
+        AND Expiry_Date > ?
+    """, (current_date,)).fetchall()
 
     conn.close()
     return [f[0] for f in foods]
@@ -83,7 +86,7 @@ def get_safe_foods():
 foods = get_safe_foods()
 
 if not foods:
-    st.warning("No safe food available right now.")
+    st.warning("⚠️ No fresh and available food items right now.")
     st.stop()
 
 food_type = st.selectbox("Food Type Needed", foods)
@@ -118,26 +121,27 @@ if st.session_state.search_results:
     else:
         st.success("✅ Nearest Safe Donors Found!")
 
-        # 🔥 COMBINE SESSION + DB EXCLUSIONS
-        db_excluded = get_excluded_donors(receiver_id)
-        all_excluded = db_excluded.union(st.session_state.excluded_donors)
+        filtered_results = []
 
-        if "Provider_ID" in results.columns:
-            results = results[
-                ~results["Provider_ID"].isin(all_excluded)
-            ]
+        for _, row in results.iterrows():
 
-        if results.empty:
-            st.warning("⚠️ No new donors available. Try again later.")
+            blocked = get_blocked_donors(receiver_id, row['Food_ID'])
+
+            if row['Provider_ID'] not in blocked:
+                filtered_results.append(row)
+
+        if not filtered_results:
+            st.warning("⚠️ Previous donors didn’t respond. Showing new donors if available.")
         else:
-
-            for _, row in results.sort_values("distance_km").iterrows():
+            for row in sorted(filtered_results, key=lambda x: x['distance_km']):
 
                 st.write("------")
                 st.write(f"🍲 **Food:** {row['Food_Name']}")
                 st.write(f"📦 Quantity Available: {row['Quantity']}")
                 st.write(f"🏪 Provider: {row['Provider_Type']}")
                 st.write(f"📍 Distance: {round(row['distance_km'],2)} km")
+
+                st.caption("⚡ Donor should respond within 15 minutes or request will expire")
 
                 request_qty = st.number_input(
                     "Request quantity",
@@ -147,6 +151,8 @@ if st.session_state.search_results:
                 )
 
                 if st.button("Send Request", key=f"req_{row['Food_ID']}"):
+
+                    st.info("⏳ Waiting for donor response (max 15 mins)...")
 
                     conn = connect_db()
                     cursor = conn.cursor()
@@ -174,9 +180,6 @@ if st.session_state.search_results:
                         st.error("Quantity exceeds available stock.")
                         st.stop()
 
-                    # ✅ ADD TO SESSION EXCLUDED
-                    st.session_state.excluded_donors.add(donor_id)
-
                     cursor.execute("""
                         INSERT INTO requests
                         (food_id, donor_id, recipient_id,
@@ -197,9 +200,9 @@ if st.session_state.search_results:
                     st.session_state.success_msg = "✅ Request sent successfully!"
                     st.rerun()
 
-# =================================================
-# REQUEST STATUS + AUTO EXCLUDE FIX 🔥
-# =================================================
+# ------------------------------------------------
+# REQUEST STATUS
+# ------------------------------------------------
 st.divider()
 st.subheader("📦 My Request Status")
 
@@ -232,7 +235,7 @@ for r in requests:
     if status == "PENDING":
         req_time = datetime.fromisoformat(req_time)
 
-        if datetime.now() - req_time > timedelta(minutes=30):
+        if datetime.now() - req_time > timedelta(minutes=15):
 
             conn = connect_db()
             cursor = conn.cursor()
@@ -245,10 +248,6 @@ for r in requests:
             conn.close()
 
             status = "EXPIRED"
-
-    # ✅ AUTO EXCLUDE EXPIRED / REJECTED DONORS
-    if status in ["EXPIRED", "REJECTED"]:
-        st.session_state.excluded_donors.add(donor_id)
 
     updated_requests.append((request_id, food_name, qty, status, donor_name, food_id))
 
